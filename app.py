@@ -22,7 +22,7 @@ from typing import Dict, Optional
 
 from flask import Flask, jsonify, render_template, request, send_file
 
-from backend import analysis, audio_io, chords, effects, mixer, realtime, separation, storage
+from backend import analysis, audio_io, chords, effects, mixer, realtime, separation, silence, storage
 
 try:
     from flask_cors import CORS
@@ -86,6 +86,7 @@ def _register_derived(source_id: str, name: str, wav_path: str,
 PAGES = {
     "library": "音频库",
     "waveform": "波形编辑",
+    "silence": "静音修剪",
     "spectrogram": "频谱分析",
     "pitch_beat": "音高与节拍",
     "chords": "和弦识别",
@@ -390,6 +391,82 @@ def api_edit(file_id: str):
     _apply_edit(_abs_path(entry), dst, op, data.get("params", {}))
     new_entry = _register_derived(entry["id"], name, dst, {"op": op})
     return jsonify(new_entry)
+
+
+# --------------------------------------------------------------------------- #
+# Silence detection & trimming
+# --------------------------------------------------------------------------- #
+
+def _silence_detect_params(data: Dict):
+    """Extract / validate the shared silence-detection parameters."""
+    auto = bool(data.get("adaptive", True))
+    threshold = data.get("threshold_db", None)
+    threshold_db = None if auto else float(threshold)
+    min_silence = max(0.01, min(60.0, float(data.get("min_silence", silence.DEFAULT_MIN_SILENCE))))
+    min_sound = max(0.0, min(5.0, float(data.get("min_sound", silence.DEFAULT_MIN_SOUND))))
+    margin_db = max(0.0, min(40.0, float(data.get("margin_db", silence.DEFAULT_MARGIN_DB))))
+    hysteresis_db = max(0.0, min(20.0, float(data.get("hysteresis_db", silence.DEFAULT_HYSTERESIS_DB))))
+    return {
+        "threshold_db": threshold_db,
+        "min_silence": min_silence,
+        "min_sound": min_sound,
+        "margin_db": margin_db,
+        "hysteresis_db": hysteresis_db,
+    }
+
+
+@app.post("/api/audio/<file_id>/silence/detect")
+def api_silence_detect(file_id: str):
+    entry = _entry(file_id)
+    if not entry:
+        return jsonify(error="file not found"), 404
+    data = request.get_json(force=True) or {}
+    try:
+        report = silence.detect_silence(_abs_path(entry), **_silence_detect_params(data))
+    except (TypeError, ValueError) as e:
+        return jsonify(error=str(e)), 400
+    return jsonify(report)
+
+
+@app.post("/api/audio/<file_id>/silence/trim")
+def api_silence_trim(file_id: str):
+    entry = _entry(file_id)
+    if not entry:
+        return jsonify(error="file not found"), 404
+    data = request.get_json(force=True) or {}
+
+    middle = data.get("middle", "keep")
+    if middle not in ("keep", "remove", "leave"):
+        return jsonify(error="middle must be keep / remove / leave"), 400
+    keep_seconds = max(0.0, min(60.0, float(data.get("keep_seconds", silence.DEFAULT_KEEP_SECONDS))))
+    edge_padding = max(0.0, min(2.0, float(data.get("edge_padding", silence.DEFAULT_EDGE_PADDING))))
+    crossfade_ms = max(0.0, min(200.0, float(data.get("crossfade_ms", silence.DEFAULT_CROSSFADE_MS))))
+    trim_edges = bool(data.get("trim_edges", True))
+
+    selection = data.get("selection")
+    if selection is not None:
+        try:
+            selection = [int(i) for i in selection]
+        except (TypeError, ValueError):
+            return jsonify(error="selection must be a list of region indices"), 400
+
+    name = data.get("name") or f"silence-trim-{entry['name']}"
+    file_id_new = storage.new_id()
+    dst = os.path.join(store.audio_dir, file_id_new + ".wav")
+    try:
+        params = _silence_detect_params(data)
+        report, summary = silence.trim_silence(
+            _abs_path(entry), dst,
+            trim_edges=trim_edges, middle=middle, keep_seconds=keep_seconds,
+            edge_padding=edge_padding, crossfade_ms=crossfade_ms,
+            selection=selection, **params)
+    except (TypeError, ValueError) as e:
+        if os.path.exists(dst):
+            os.unlink(dst)
+        return jsonify(error=str(e)), 400
+
+    new_entry = _register_derived(entry["id"], name, dst, {"silence_trim": summary})
+    return jsonify({"file": new_entry, "report": report, "summary": summary})
 
 
 # --------------------------------------------------------------------------- #

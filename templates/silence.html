@@ -1,0 +1,393 @@
+{% extends "base.html" %}
+{% block title %}静音检测与修剪{% endblock %}
+{% block content %}
+<div class="main-head">
+  <div>
+    <h1>静音检测与修剪</h1>
+    <div class="sub">自适应噪声底阈值 · 迟滞判定 · 去首尾静音 / 压缩或删除中间停顿 · 段落勾选</div>
+  </div>
+  <div class="row">
+    <select id="fileSel" style="min-width:220px"></select>
+    <button class="btn-primary" id="detectBtn">检测静音</button>
+  </div>
+</div>
+
+<div class="card">
+  <div class="row between mb">
+    <div class="row">
+      <button id="playBtn">▶ 播放原文件</button>
+      <span id="timeLabel" class="mono muted">0:00.0 / 0:00.0</span>
+    </div>
+    <div class="row small muted">
+      <div class="legend">
+        <span><span class="dot" style="background:var(--red);opacity:.55"></span>检测到的静音</span>
+        <span><span class="dot" style="background:var(--amber)"></span>阈值</span>
+        <span><span class="dot" style="background:var(--green)"></span>播放头</span>
+      </div>
+    </div>
+  </div>
+  <div class="plot"><canvas id="env" style="height:240px"></canvas></div>
+  <div id="levelInfo" class="row mt small muted"></div>
+</div>
+
+<div class="card">
+  <h2>检测参数</h2>
+  <div class="grid cols-4">
+    <label class="field">检测阈值 (dB)
+      <input type="range" id="thresholdDb" min="-80" max="0" step="0.5" value="-45"/>
+      <span class="small"><span id="thresholdVal">自适应</span></span>
+    </label>
+    <label class="field inline" style="margin-top:16px">
+      <input type="checkbox" id="adaptive" checked/> 自适应（按噪声底估算）
+    </label>
+    <label class="field">最小静音时长 (s)
+      <input type="range" id="minSilence" min="0.05" max="3" step="0.05" value="0.30"/>
+      <span class="small"><span id="minSilenceVal">0.30</span> s · 短于该值的说话间隙保留</span>
+    </label>
+    <label class="field">桥接短有声段 (s)
+      <input type="range" id="minSound" min="0" max="0.5" step="0.01" value="0.06"/>
+      <span class="small"><span id="minSoundVal">0.06</span> s · 咔哒声不切断长静音</span>
+    </label>
+  </div>
+  <div class="grid cols-4 mt">
+    <label class="field">噪声余量 (dB)
+      <input type="range" id="marginDb" min="3" max="25" step="0.5" value="10"/>
+      <span class="small"><span id="marginVal">10.0</span> dB · 阈值高出噪声底多少</span>
+    </label>
+    <label class="field">迟滞 (dB)
+      <input type="range" id="hystDb" min="0" max="12" step="0.5" value="4"/>
+      <span class="small"><span id="hystVal">4.0</span> dB · 防止临界值抖动</span>
+    </label>
+    <label class="field">中间静音保留长度 (s)
+      <input type="range" id="keepSec" min="0" max="2" step="0.05" value="0.30"/>
+      <span class="small"><span id="keepVal">0.30</span> s · 压缩后剩余长度（0 = 整段删除）</span>
+    </label>
+    <label class="field">拼接交叉淡化 (ms)
+      <input type="range" id="xfadeMs" min="0" max="60" step="1" value="5"/>
+      <span class="small"><span id="xfadeVal">5</span> ms · 消除拼接咔哒声</span>
+    </label>
+  </div>
+  <div class="row mt">
+    <label class="field inline"><input type="checkbox" id="trimEdges" checked/> 去掉开头/结尾静音</label>
+    <label class="field inline">边缘保留
+      <input type="number" id="edgePad" value="0.02" min="0" max="0.5" step="0.01" style="width:70px"/> s
+    </label>
+    <button id="redetectBtn">按当前参数重新检测</button>
+  </div>
+</div>
+
+<div class="card">
+  <div class="row between mb">
+    <h2 style="margin:0">检测到的静音段落 <span id="statLine" class="muted small"></span></h2>
+    <div class="row">
+      <button class="btn-sm" id="selAll">全选</button>
+      <button class="btn-sm" id="selNone">全不选</button>
+      <button class="btn-sm" id="selInternal">仅中间</button>
+    </div>
+  </div>
+  <div id="regionList" class="muted small">尚未检测。选择音频后点击「检测静音」。</div>
+  <div class="row mt">
+    <button class="btn-green" id="trimEdgesBtn">一键去首尾静音</button>
+    <button class="btn-primary" id="compressBtn">按勾选执行（压缩中间）</button>
+    <button class="btn-danger" id="deleteBtn">按勾选整段删除</button>
+    <span id="opStatus" class="muted small"></span>
+  </div>
+</div>
+
+<div class="card hidden" id="resultCard">
+  <h2>处理结果</h2>
+  <div id="resultBody"></div>
+</div>
+
+<details class="help">
+  <summary>原理说明 / 极端情况</summary>
+  检测器先按约 10 ms 分帧计算 RMS(dB)，做中值去咔哒与「快启动、慢释放」包络平滑；
+  自适应模式用全片段位的 15 分位估计噪声底、90 分位估计有效电平，阈值取噪声底 + 余量，
+  并强制低于有效电平 6 dB 以上——因此含持续底噪、音量起伏大的录音也不会把小声内容判成静音。
+  迟滞（进入阈值后需回升阈值+迟滞才算有声）配合最小静音时长，可区分说话间隙短停顿与真正静音；
+  短于「桥接」时长的孤立咔哒声不会把长静音切断。
+  整段几乎没有静音时段落列表为空、修剪结果与原文件一致；整段几乎全静音时会给出警告，
+  并保留约 0.25 s 的片段而非输出空文件。
+</details>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let report = null, currentId = null;
+const audio = new Audio();
+
+async function loadFiles(selected) {
+  const files = await API.get("/api/library");
+  const sel = $("#fileSel");
+  sel.innerHTML = files.map(f => `<option value="${f.id}">${esc(f.name)}</option>`).join("");
+  if (selected) sel.value = selected;
+}
+
+function bindRange(id, valId, fmt) {
+  const el = $(id), out = $(valId);
+  const upd = () => out.textContent = fmt(+el.value);
+  el.addEventListener("input", upd); upd();
+}
+bindRange("#minSilence", "#minSilenceVal", v => v.toFixed(2));
+bindRange("#minSound", "#minSoundVal", v => v.toFixed(2));
+bindRange("#marginDb", "#marginVal", v => v.toFixed(1));
+bindRange("#hystDb", "#hystVal", v => v.toFixed(1));
+bindRange("#keepSec", "#keepVal", v => v.toFixed(2));
+bindRange("#xfadeMs", "#xfadeVal", v => String(v | 0));
+
+const adaptiveEl = $("#adaptive"), thrEl = $("#thresholdDb"), thrVal = $("#thresholdVal");
+function syncThresholdUI() {
+  if (adaptiveEl.checked) {
+    thrEl.disabled = true;
+    thrVal.textContent = "自适应";
+  } else {
+    thrEl.disabled = false;
+    thrVal.textContent = thrEl.value + " dB";
+  }
+}
+adaptiveEl.addEventListener("change", syncThresholdUI);
+thrEl.addEventListener("input", syncThresholdUI);
+syncThresholdUI();
+
+function detectParams() {
+  return {
+    adaptive: adaptiveEl.checked,
+    threshold_db: +thrEl.value,
+    min_silence: +$("#minSilence").value,
+    min_sound: +$("#minSound").value,
+    margin_db: +$("#marginDb").value,
+    hysteresis_db: +$("#hystDb").value,
+  };
+}
+
+async function runDetect() {
+  const id = $("#fileSel").value;
+  if (!id) return toast("请先选择音频", "warn");
+  currentId = id;
+  audio.src = API.fileUrl(id);
+  $("#detectBtn").disabled = true;
+  $("#opStatus").textContent = "检测中…";
+  try {
+    report = await API.post(`/api/audio/${id}/silence/detect`, detectParams());
+    if (!adaptiveEl.checked) thrVal.textContent = thrEl.value + " dB";
+    renderReport();
+    $("#opStatus").textContent = "";
+  } catch (e) {
+    $("#opStatus").textContent = "";
+    toast(e.message, "error");
+  } finally {
+    $("#detectBtn").disabled = false;
+  }
+}
+
+$("#detectBtn").onclick = runDetect;
+$("#redetectBtn").onclick = runDetect;
+
+/* ------------------------------------------------------------ visualization */
+
+function drawEnv() {
+  const canvas = $("#env");
+  const { ctx, w, h } = setupCanvas(canvas);
+  ctx.clearRect(0, 0, w, h);
+  const padL = 46, padB = 18, padT = 8;
+  const pw = w - padL - 8, ph = h - padB - padT;
+  const dbMin = -80, dbMax = 0;
+  const yAt = db => padT + ph * (1 - (db - dbMin) / (dbMax - dbMin));
+  const xAt = t => padL + (report ? t / report.duration * pw : 0);
+
+  // grid
+  ctx.strokeStyle = "rgba(139,148,158,0.15)";
+  ctx.fillStyle = "rgba(139,148,158,0.6)";
+  ctx.font = "10px sans-serif";
+  for (const g of [0, -20, -40, -60, -80]) {
+    const y = yAt(g);
+    ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(padL + pw, y); ctx.stroke();
+    ctx.fillText(g + "dB", 6, y + 3);
+  }
+
+  if (!report) return;
+
+  // silent region highlights
+  for (const r of report.regions) {
+    const x0 = xAt(r.start), x1 = xAt(r.end);
+    ctx.fillStyle = r.checked === false ? "rgba(248,81,73,0.10)" : "rgba(248,81,73,0.28)";
+    ctx.fillRect(x0, padT, Math.max(1, x1 - x0), ph);
+  }
+
+  // level envelope
+  const env = report.envelope;
+  ctx.strokeStyle = getComputedStyle(document.documentElement).getPropertyValue("--accent").trim() || "#58a6ff";
+  ctx.lineWidth = 1.3;
+  ctx.beginPath();
+  for (let i = 0; i < env.times.length; i++) {
+    const x = xAt(env.times[i]), y = yAt(Math.max(dbMin, env.db[i]));
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+
+  // threshold line
+  const thr = report.threshold.threshold_db;
+  const yt = yAt(thr);
+  ctx.strokeStyle = getComputedStyle(document.documentElement).getPropertyValue("--amber").trim() || "#d29922";
+  ctx.setLineDash([6, 4]);
+  ctx.beginPath(); ctx.moveTo(padL, yt); ctx.lineTo(padL + pw, yt); ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue("--amber").trim() || "#d29922";
+  ctx.fillText(`阈值 ${thr.toFixed(1)} dB`, padL + pw - 92, yt - 4);
+
+  // playhead
+  if (audio.duration) {
+    const x = xAt(audio.currentTime);
+    ctx.fillStyle = "rgba(63,185,80,0.85)";
+    ctx.fillRect(x - 1, padT, 2, ph);
+  }
+}
+
+audio.addEventListener("timeupdate", () => {
+  if (report) {
+    $("#timeLabel").textContent = `${fmtTime(audio.currentTime)} / ${fmtTime(report.duration)}`;
+    drawEnv();
+  }
+});
+$("#playBtn").addEventListener("click", () => {
+  if (!currentId) return;
+  if (audio.paused) { audio.play(); $("#playBtn").textContent = "⏸ 暂停"; }
+  else { audio.pause(); $("#playBtn").textContent = "▶ 播放原文件"; }
+});
+
+/* ------------------------------------------------------------- region list */
+
+const POS_LABEL = { leading: "开头", trailing: "结尾", internal: "中间", all: "整段" };
+
+function renderReport() {
+  const t = report.threshold, s = report.stats;
+  $("#statLine").textContent =
+    `共 ${s.count} 段 · 静音占比 ${(s.ratio * 100).toFixed(1)}% · ` +
+    `合计 ${s.total_silence.toFixed(2)}s（开头 ${s.leading} / 中间 ${s.internal} / 结尾 ${s.trailing}）`;
+  $("#levelInfo").innerHTML =
+    `时长 ${report.duration.toFixed(2)}s · 噪声底估计 <b>${t.noise_floor_db.toFixed(1)} dB</b> · ` +
+    `有效电平 <b>${t.active_db.toFixed(1)} dB</b> · ` +
+    `判定阈值 <b>${t.threshold_db.toFixed(1)} dB</b>${t.adaptive ? "（自适应）" : "（手动）"}`;
+
+  let banner = "";
+  if (report.all_silence) {
+    banner = `<div class="mb"><span class="badge red">整段几乎全是静音</span>
+      <span class="muted small">修剪将只保留约 0.25 s 片段，建议检查阈值是否过高。</span></div>`;
+  } else if (report.no_silence) {
+    banner = `<div class="mb"><span class="badge green">几乎没有检测到静音</span>
+      <span class="muted small">执行修剪不会改变音频；可尝试降低阈值或调大最小静音时长。</span></div>`;
+  }
+
+  const rows = report.regions.length ? report.regions.map(r => `
+    <tr>
+      <td><input type="checkbox" data-idx="${r.index}" ${r.checked === false ? "" : "checked"}/></td>
+      <td><span class="badge ${r.position === "internal" ? "purple" : "amber"}">${POS_LABEL[r.position]}</span></td>
+      <td class="mono">${fmtTime(r.start)} – ${fmtTime(r.end)}</td>
+      <td class="mono">${r.duration.toFixed(2)} s</td>
+      <td class="mono muted">${r.mean_db.toFixed(1)} dB</td>
+      <td><button class="btn-sm" data-play="${r.index}">试听段落前</button></td>
+    </tr>`).join("") :
+    `<tr><td colspan="6" class="muted">未发现满足条件的静音段落。</td></tr>`;
+
+  $("#regionList").innerHTML = banner + `
+    <table><thead><tr>
+      <th style="width:36px">勾选</th><th>位置</th><th>区间</th><th>时长</th><th>平均电平</th><th></th>
+    </tr></thead><tbody>${rows}</tbody></table>`;
+
+  $$("#regionList input[type=checkbox]").forEach(cb =>
+    cb.addEventListener("change", () => {
+      const r = report.regions.find(x => x.index === +cb.dataset.idx);
+      r.checked = cb.checked;
+      drawEnv();
+    }));
+  $$("#regionList [data-play]").forEach(btn =>
+    btn.addEventListener("click", () => {
+      const r = report.regions.find(x => x.index === +btn.dataset.play);
+      audio.currentTime = Math.max(0, r.start - 0.4);
+      audio.play();
+    }));
+  drawEnv();
+}
+
+function selectedIndices() {
+  if (!report) return [];
+  return report.regions.filter(r => r.checked !== false).map(r => r.index);
+}
+function setCheck(pred) {
+  if (!report) return;
+  report.regions.forEach(r => { r.checked = pred(r); });
+  renderReport();
+}
+$("#selAll").onclick = () => setCheck(() => true);
+$("#selNone").onclick = () => setCheck(() => false);
+$("#selInternal").onclick = () => setCheck(r => r.position === "internal");
+
+/* ------------------------------------------------------------------- apply */
+
+async function applyTrim(middle, opts = {}) {
+  if (!report) return toast("请先检测静音", "warn");
+  const body = {
+    ...detectParams(),
+    trim_edges: $("#trimEdges").checked,
+    middle,
+    keep_seconds: +$("#keepSec").value,
+    edge_padding: +$("#edgePad").value,
+    crossfade_ms: +$("#xfadeMs").value,
+    selection: selectedIndices(),
+  };
+  Object.assign(body, opts);
+  const btn = $("#compressBtn");
+  $("#opStatus").textContent = "渲染中…";
+  try {
+    const r = await API.post(`/api/audio/${currentId}/silence/trim`, body);
+    $("#opStatus").textContent = "";
+    showResult(r, middle);
+  } catch (e) {
+    $("#opStatus").textContent = "";
+    toast(e.message, "error");
+  }
+}
+
+$("#trimEdgesBtn").onclick = () => applyTrim("leave", { trim_edges: true });
+$("#compressBtn").onclick = () => applyTrim(+$("#keepSec").value === 0 ? "remove" : "keep");
+$("#deleteBtn").onclick = () => applyTrim("remove");
+
+function showResult(r, middle) {
+  const f = r.file, sm = r.summary;
+  let warning = "";
+  if (sm.mostly_silence) warning = `<div class="mb"><span class="badge red">原音频几乎全为静音</span> 结果只保留了其中极少的有声内容。</div>`;
+  if (sm.removed_seconds < 1e-6) warning = `<div class="mb"><span class="badge green">无可修剪内容</span> 结果与原文件一致。</div>`;
+  $("#resultCard").classList.remove("hidden");
+  $("#resultBody").innerHTML = warning + `
+    <div class="file-card row between">
+      <div>
+        <div class="name">${esc(f.name)}</div>
+        <div class="meta">
+          ${fmtTime(sm.original_duration)} → <b>${fmtTime(sm.result_duration)}</b>
+          · 去除 ${sm.removed_seconds.toFixed(2)} s
+          · 作用于 ${sm.regions_applied.length} 个段落
+          · ${f.sr} Hz · ${f.channels} 声道
+        </div>
+      </div>
+      <div class="row">
+        <button class="btn-sm btn-green" id="playNew">▶ 播放结果</button>
+        <a class="btn btn-sm" href="${API.downloadUrl(f.id)}">下载</a>
+        <button class="btn-sm" id="openNew">在本页加载</button>
+      </div>
+    </div>`;
+  const newAudio = new Audio(API.fileUrl(f.id));
+  $("#playNew").onclick = () => newAudio.paused ? newAudio.play() : newAudio.pause();
+  $("#openNew").onclick = async () => {
+    await loadFiles(f.id);
+    runDetect();
+  };
+  toast("修剪完成，已生成新文件", "success");
+}
+
+/* --------------------------------------------------------------------- init */
+
+(async () => {
+  await loadFiles(new URLSearchParams(location.search).get("file"));
+})();
+</script>
+{% endblock %}
