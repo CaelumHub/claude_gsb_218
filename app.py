@@ -22,7 +22,7 @@ from typing import Dict, Optional
 
 from flask import Flask, jsonify, render_template, request, send_file
 
-from backend import analysis, audio_io, chords, effects, mixer, realtime, separation, storage
+from backend import analysis, audio_io, chords, effects, mixer, realtime, separation, silence, storage
 
 try:
     from flask_cors import CORS
@@ -86,6 +86,7 @@ def _register_derived(source_id: str, name: str, wav_path: str,
 PAGES = {
     "library": "音频库",
     "waveform": "波形编辑",
+    "silence": "静音修剪",
     "spectrogram": "频谱分析",
     "pitch_beat": "音高与节拍",
     "chords": "和弦识别",
@@ -389,6 +390,79 @@ def api_edit(file_id: str):
     dst = os.path.join(store.audio_dir, file_id_new + ".wav")
     _apply_edit(_abs_path(entry), dst, op, data.get("params", {}))
     new_entry = _register_derived(entry["id"], name, dst, {"op": op})
+    return jsonify(new_entry)
+
+
+# --------------------------------------------------------------------------- #
+# Silence detection & trimming
+# --------------------------------------------------------------------------- #
+
+def _silence_params(data: Dict) -> Dict:
+    """Extract and sanity-clamp the shared detection parameters."""
+    thr = data.get("threshold_db")
+    return {
+        "threshold_db": float(thr) if thr is not None else None,
+        "min_silence": max(0.05, float(data.get("min_silence", 0.5))),
+        "hysteresis_db": min(24.0, max(0.0, float(data.get("hysteresis_db", 4.0)))),
+        "merge_gap": min(2.0, max(0.0, float(data.get("merge_gap", 0.15)))),
+    }
+
+
+@app.post("/api/silence/<file_id>/detect")
+def api_silence_detect(file_id: str):
+    entry = _entry(file_id)
+    if not entry:
+        return jsonify(error="file not found"), 404
+    data = request.get_json(force=True) or {}
+    result = silence.detect(_abs_path(entry), **_silence_params(data))
+    return jsonify(result)
+
+
+@app.post("/api/silence/<file_id>/apply")
+def api_silence_apply(file_id: str):
+    entry = _entry(file_id)
+    if not entry:
+        return jsonify(error="file not found"), 404
+    data = request.get_json(force=True) or {}
+    mode = data.get("mode", "trim_ends")
+    if mode not in ("trim_ends", "compress"):
+        return jsonify(error="unknown mode"), 400
+    keep = max(0.0, float(data.get("keep", 0.3)))
+    pad = min(1.0, max(0.0, float(data.get("pad", 0.05))))
+    selected = data.get("segments")  # list of segment indices, or None = all
+
+    # Re-run detection with the same parameters so segment indices are stable.
+    det = silence.detect(_abs_path(entry), **_silence_params(data))
+    duration = det["stats"]["duration"]
+    cuts = silence.build_cut_plan(duration, det["segments"], mode,
+                                  keep=keep, pad=pad, selected=selected)
+    if not cuts:
+        return jsonify({
+            "unchanged": True,
+            "message": "没有需要处理的静音段，文件未改动",
+            "detection": det,
+        })
+
+    keep_iv = silence.keep_intervals(duration, cuts)
+    all_silence_fallback = False
+    if not keep_iv:
+        # Everything would be removed (file is essentially all silence):
+        # keep a minimal centre excerpt instead of producing an empty file.
+        all_silence_fallback = True
+        half = min(duration, max(0.25, 2.0 * pad)) / 2.0
+        keep_iv = [(duration / 2.0 - half, duration / 2.0 + half)]
+
+    file_id_new = storage.new_id()
+    dst = os.path.join(store.audio_dir, file_id_new + ".wav")
+    result = silence.render(_abs_path(entry), dst, keep_iv)
+    name = data.get("name") or f"{mode}-{entry['name']}"
+    new_entry = _register_derived(entry["id"], name, dst, {
+        "op": f"silence_{mode}",
+        "silence": {"mode": mode, "keep": keep, "pad": pad,
+                    "removed": sum(b - a for a, b in cuts)},
+    })
+    new_entry["removed_seconds"] = round(sum(b - a for a, b in cuts), 3)
+    new_entry["all_silence_fallback"] = all_silence_fallback
     return jsonify(new_entry)
 
 

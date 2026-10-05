@@ -1,0 +1,339 @@
+{% extends "base.html" %}
+{% block title %}静音修剪{% endblock %}
+{% block content %}
+<div class="main-head">
+  <div>
+    <h1>静音检测与修剪</h1>
+    <div class="sub">自适应阈值 · 迟滞防抖动 · 裁剪首尾静音 / 压缩或删除中间静音 · 人工勾选</div>
+  </div>
+  <div class="row">
+    <select id="fileSel" style="min-width:220px"></select>
+    <button class="btn-primary" id="loadBtn">加载</button>
+  </div>
+</div>
+
+<div class="card">
+  <h2>检测参数</h2>
+  <div class="row">
+    <label class="field inline">
+      <input type="checkbox" id="autoThr" checked style="width:auto"/>
+      <span>自动阈值 <b class="faint mono" id="thrUsed"></b></span>
+    </label>
+    <label class="field inline">阈值(dB)
+      <input type="number" id="thrDb" value="-40" min="-100" max="0" step="1" style="width:80px" disabled/>
+    </label>
+    <label class="field inline">最小静音时长(s)
+      <input type="number" id="minSil" value="0.5" min="0.05" max="10" step="0.05" style="width:80px"/>
+    </label>
+    <label class="field inline">合并间隔(s)
+      <input type="number" id="mergeGap" value="0.15" min="0" max="2" step="0.05" style="width:80px"/>
+    </label>
+    <label class="field inline">迟滞(dB)
+      <input type="number" id="hyst" value="4" min="0" max="24" step="0.5" style="width:70px"/>
+    </label>
+    <button class="btn-primary" id="detectBtn">重新检测</button>
+  </div>
+  <div class="mt small muted">
+    自动阈值根据估计的底噪电平自适应（底噪 + 动态范围的 1/4，限幅 6–18 dB），适合音量起伏大、含细微底噪的录音；
+    迟滞让进入/退出静音使用不同门限，避免边界抖动；短于「合并间隔」的非静音（爆点、咂嘴）会被并入相邻静音，
+    短于「最小静音时长」的停顿（说话间隙）不会被当作静音。
+  </div>
+</div>
+
+<div class="card">
+  <div class="row between mb">
+    <div class="row">
+      <button id="playBtn">▶ 播放</button>
+      <span id="timeLabel" class="mono muted">0:00.0 / 0:00.0</span>
+    </div>
+    <div class="row small muted" id="statLine"></div>
+  </div>
+  <div class="plot"><canvas id="wave" style="height:200px"></canvas></div>
+  <div class="row mt small muted">
+    <div class="legend">
+      <span><span class="dot" style="background:var(--accent)"></span>波形包络</span>
+      <span><span class="dot" style="background:var(--red)"></span>检测到的静音段</span>
+      <span><span class="dot" style="background:var(--green)"></span>播放头</span>
+    </div>
+  </div>
+</div>
+
+<div class="card">
+  <h2>电平包络与阈值</h2>
+  <div class="plot"><canvas id="envPlot" style="height:160px"></canvas></div>
+  <div class="row mt small muted">
+    <div class="legend">
+      <span><span class="dot" style="background:var(--accent)"></span>短时电平 (dB)</span>
+      <span><span class="dot" style="background:var(--amber)"></span>检测阈值</span>
+      <span><span class="dot" style="background:var(--red)"></span>静音段</span>
+    </div>
+  </div>
+</div>
+
+<div class="card" id="segCard">
+  <div class="row between mb">
+    <h2 style="margin:0">检测到的静音段 <span class="badge" id="segCount">0</span></h2>
+    <div class="row">
+      <button class="btn-sm" id="selAll">全选</button>
+      <button class="btn-sm" id="selNone">全不选</button>
+      <button class="btn-sm" id="selEnds">仅首尾</button>
+    </div>
+  </div>
+  <div id="segEmpty" class="muted small">尚未检测，或当前参数下没有静音段。</div>
+  <div style="overflow-x:auto">
+    <table id="segTable" class="hidden">
+      <thead><tr>
+        <th></th><th>#</th><th>位置</th><th>开始</th><th>结束</th><th>时长</th><th>平均电平</th>
+      </tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+</div>
+
+<div class="card">
+  <h2>应用修剪</h2>
+  <div class="row">
+    <button class="btn-primary" id="applyTrim">✂ 裁剪首尾静音</button>
+    <span class="spacer"></span>
+    <label class="field inline">压缩后保留(s)
+      <input type="number" id="keep" value="0.3" min="0" max="10" step="0.1" style="width:80px"/>
+    </label>
+    <label class="field inline">边界留白(s)
+      <input type="number" id="pad" value="0.05" min="0" max="1" step="0.01" style="width:80px"/>
+    </label>
+    <button class="btn-green" id="applyCompress">⏩ 压缩/删除勾选的静音段</button>
+  </div>
+  <div class="mt small muted">
+    「裁剪首尾」只作用于勾选中位于文件开头/结尾的静音段（保留「边界留白」长度的气息）；
+    「压缩/删除」把每个勾选的静音段缩短到「压缩后保留」长度，填 0 表示整段删除（实际保留不少于 2×边界留白，避免切到内容）。
+    每个操作都会生成一个新文件，原文件保留。
+  </div>
+</div>
+
+<div class="card hidden" id="resultCard">
+  <h2>处理结果</h2>
+  <div class="row" id="resultRow"></div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let env = null, det = null, currentId = null;
+const audio = new Audio();
+
+async function loadFiles(selected) {
+  const files = await API.get("/api/library");
+  const sel = $("#fileSel");
+  sel.innerHTML = files.map(f => `<option value="${f.id}">${esc(f.name)}</option>`).join("");
+  if (selected) sel.value = selected;
+}
+
+function detectParams() {
+  return {
+    threshold_db: $("#autoThr").checked ? null : +$("#thrDb").value,
+    min_silence: +$("#minSil").value,
+    merge_gap: +$("#mergeGap").value,
+    hysteresis_db: +$("#hyst").value,
+  };
+}
+
+async function loadAll() {
+  const id = $("#fileSel").value;
+  if (!id) return;
+  currentId = id;
+  env = await API.get(`/api/audio/${id}/waveform?points=3000`);
+  audio.src = API.fileUrl(id);
+  $("#timeLabel").textContent = `0:00.0 / ${fmtTime(env.duration)}`;
+  await runDetect();
+}
+
+async function runDetect() {
+  if (!currentId) return;
+  $("#detectBtn").disabled = true;
+  try {
+    det = await API.post(`/api/silence/${currentId}/detect`, detectParams());
+    renderStats();
+    renderSegList();
+    drawWave();
+    drawEnv();
+    if (det.stats.all_silence) toast("整段几乎都是静音，请谨慎应用修剪", "warn");
+    else if (det.stats.no_silence) toast("未检测到静音段", "info");
+  } catch (e) {
+    toast("检测失败: " + e.message, "error");
+  } finally {
+    $("#detectBtn").disabled = false;
+  }
+}
+
+function renderStats() {
+  const s = det.stats;
+  $("#thrUsed").textContent = s.auto_threshold ? `→ ${s.threshold_db.toFixed(1)} dB` : "";
+  $("#statLine").innerHTML =
+    `<span>总时长 ${fmtTime(s.duration)}</span><span>·</span>` +
+    `<span>静音 ${fmtTime(s.silence_total)} (${(s.silence_ratio * 100).toFixed(1)}%)</span><span>·</span>` +
+    `<span>底噪 ${s.noise_db.toFixed(1)} dB</span><span>·</span>` +
+    `<span>阈值 ${s.threshold_db.toFixed(1)} dB${s.auto_threshold ? " (自动)" : ""}</span>` +
+    (s.all_silence ? `<span class="badge amber">几乎全是静音</span>` : "") +
+    (s.no_silence ? `<span class="badge green">无静音</span>` : "");
+}
+
+function posBadge(seg) {
+  if (seg.is_leading && seg.is_trailing) return `<span class="badge red">整段</span>`;
+  if (seg.is_leading) return `<span class="badge amber">开头</span>`;
+  if (seg.is_trailing) return `<span class="badge amber">结尾</span>`;
+  return `<span class="badge neutral">中间</span>`;
+}
+
+function renderSegList() {
+  const segs = det.segments;
+  $("#segCount").textContent = segs.length;
+  const tbl = $("#segTable"), empty = $("#segEmpty");
+  if (!segs.length) {
+    tbl.classList.add("hidden");
+    empty.classList.remove("hidden");
+    empty.textContent = det.stats.no_silence
+      ? "当前参数下没有检测到静音段（可降低阈值或缩短最小静音时长后重试）。"
+      : "没有符合条件的静音段。";
+    return;
+  }
+  empty.classList.add("hidden");
+  tbl.classList.remove("hidden");
+  tbl.querySelector("tbody").innerHTML = segs.map((s, i) => `
+    <tr>
+      <td><input type="checkbox" data-seg="${i}" checked style="width:auto"/></td>
+      <td class="mono">${i + 1}</td>
+      <td>${posBadge(s)}</td>
+      <td class="mono">${fmtTime(s.start)}</td>
+      <td class="mono">${fmtTime(s.end)}</td>
+      <td class="mono">${s.duration.toFixed(2)}s</td>
+      <td class="mono">${s.avg_db.toFixed(1)} dB</td>
+    </tr>`).join("");
+}
+
+function checkedSegments() {
+  return $$("#segTable input[type=checkbox]").filter(cb => cb.checked).map(cb => +cb.dataset.seg);
+}
+
+/* ------------------------------------------------------------- drawing */
+
+function drawWave() {
+  const c = $("#wave");
+  drawWaveform(c, env, {
+    playhead: audio.duration ? audio.currentTime / audio.duration : null,
+  });
+  if (!det || !det.segments.length || !env) return;
+  const { ctx, w, h } = setupCanvas(c);
+  ctx.fillStyle = "rgba(248,81,73,0.28)";
+  for (const s of det.segments) {
+    const a = s.start / env.duration, b = s.end / env.duration;
+    ctx.fillRect(a * w, 0, Math.max(1, (b - a) * w), h);
+  }
+}
+
+function drawEnv() {
+  const c = $("#envPlot");
+  const { ctx, w, h } = setupCanvas(c);
+  ctx.clearRect(0, 0, w, h);
+  if (!det || !det.envelope.db.length) return;
+  const dbVals = det.envelope.db, times = det.envelope.times;
+  const dur = det.stats.duration || 1;
+  const padL = 46, padR = 12, padT = 10, padB = 18;
+  const pw = w - padL - padR, ph = h - padT - padB;
+  const dbMin = -100, dbMax = 0;
+  const xAt = t => padL + (t / dur) * pw;
+  const yAt = v => padT + (1 - (Math.max(dbMin, Math.min(dbMax, v)) - dbMin) / (dbMax - dbMin)) * ph;
+
+  // grid + dB labels
+  ctx.strokeStyle = "rgba(139,148,158,0.15)";
+  ctx.fillStyle = "rgba(139,148,158,0.6)";
+  ctx.font = "10px sans-serif";
+  for (let g = 0; g <= 4; g++) {
+    const v = dbMax - (dbMax - dbMin) * (g / 4);
+    const y = yAt(v);
+    ctx.beginPath(); ctx.moveTo(padL, y); ctx.lineTo(padL + pw, y); ctx.stroke();
+    ctx.fillText(v + " dB", 4, y + 3);
+  }
+
+  // silence segments
+  ctx.fillStyle = "rgba(248,81,73,0.22)";
+  for (const s of det.segments) {
+    ctx.fillRect(xAt(s.start), padT, Math.max(1, xAt(s.end) - xAt(s.start)), ph);
+  }
+
+  // level curve
+  ctx.strokeStyle = "#58a6ff";
+  ctx.lineWidth = 1.4;
+  ctx.beginPath();
+  for (let i = 0; i < dbVals.length; i++) {
+    const x = xAt(times[i]), y = yAt(dbVals[i]);
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  }
+  ctx.stroke();
+
+  // threshold line
+  ctx.strokeStyle = "#d29922";
+  ctx.setLineDash([6, 4]);
+  ctx.beginPath();
+  const ty = yAt(det.stats.threshold_db);
+  ctx.moveTo(padL, ty); ctx.lineTo(padL + pw, ty);
+  ctx.stroke();
+  ctx.setLineDash([]);
+}
+
+/* ------------------------------------------------------------- actions */
+
+async function applyMode(mode) {
+  if (!det) return;
+  const segs = checkedSegments();
+  if (!segs.length) return toast("请至少勾选一段静音", "warn");
+  const body = Object.assign(detectParams(), {
+    mode,
+    keep: +$("#keep").value,
+    pad: +$("#pad").value,
+    segments: segs,
+    name: mode + "-" + $("#fileSel").selectedOptions[0].text,
+  });
+  try {
+    const res = await API.post(`/api/silence/${currentId}/apply`, body);
+    if (res.unchanged) { toast(res.message, "info"); return; }
+    toast(`完成：去掉 ${res.removed_seconds.toFixed(2)}s，新时长 ${fmtTime(res.duration)}`, "success");
+    if (res.all_silence_fallback) toast("整段几乎全是静音，已保留中间一小段以避免产生空文件", "warn");
+    await loadFiles(res.id);
+    $("#resultCard").classList.remove("hidden");
+    $("#resultRow").innerHTML = `
+      <button class="btn-green" onclick="openResult('${res.id}')">▶ 打开新文件</button>
+      <span class="muted">${esc(res.name)} · ${fmtTime(res.duration)}</span>`;
+  } catch (e) {
+    toast("处理失败: " + e.message, "error");
+  }
+}
+
+window.openResult = (id) => { $("#fileSel").value = id; loadAll(); };
+
+$("#autoThr").addEventListener("change", () => { $("#thrDb").disabled = $("#autoThr").checked; });
+$("#loadBtn").onclick = loadAll;
+$("#detectBtn").onclick = runDetect;
+$("#applyTrim").onclick = () => applyMode("trim_ends");
+$("#applyCompress").onclick = () => applyMode("compress");
+$("#selAll").onclick = () => $$("#segTable input[type=checkbox]").forEach(cb => cb.checked = true);
+$("#selNone").onclick = () => $$("#segTable input[type=checkbox]").forEach(cb => cb.checked = false);
+$("#selEnds").onclick = () => $$("#segTable input[type=checkbox]").forEach(cb => {
+  const s = det.segments[+cb.dataset.seg];
+  cb.checked = s.is_leading || s.is_trailing;
+});
+
+$("#playBtn").addEventListener("click", () => {
+  if (audio.paused) { audio.play(); $("#playBtn").textContent = "⏸ 暂停"; }
+  else { audio.pause(); $("#playBtn").textContent = "▶ 播放"; }
+});
+audio.addEventListener("timeupdate", () => {
+  $("#timeLabel").textContent = `${fmtTime(audio.currentTime)} / ${fmtTime(audio.duration)}`;
+  drawWave();
+});
+
+(async () => {
+  await loadFiles(new URLSearchParams(location.search).get("file"));
+  await loadAll();
+})();
+</script>
+{% endblock %}

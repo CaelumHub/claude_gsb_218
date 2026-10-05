@@ -240,9 +240,15 @@ class WavReader:
         except Exception:
             return False
 
+    def seek(self, frame: int) -> None:
+        """Reposition the read cursor to ``frame`` (clamped to the file)."""
+        frame = max(0, min(self.nframes, int(frame)))
+        self._w.setpos(frame)
+        self._pos = frame
+
     def read_excerpt(self, start_frame: int, nframes: int) -> AudioData:
         """Random-access excerpt (used for waveform preview rendering)."""
-        self._w.setpos(start_frame)
+        self.seek(start_frame)
         chunk = self.read_chunk(nframes)
         return AudioData(chunk if chunk is not None else [[] for _ in range(self.channels)], self.sr)
 
